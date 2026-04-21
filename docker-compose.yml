@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    volumes:
+      - api_data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:///./data/events.db
+      - CORS_ORIGINS=http://localhost:3000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  detector:
+    build: ./detector
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./samples:/app/samples:ro
+    environment:
+      - API_URL=http://api:8000
+      - SITE_ID=site-001
+      - FRAME_SOURCE=file
+      - VIDEO_FILE=samples/sample.mp4
+      - MODEL_PATH=yolov8n.pt
+      - CONFIDENCE_THRESHOLD=0.4
+      - INFERENCE_INTERVAL=5
+      - VIOLATION_COOLDOWN_SEC=10
+    # Linux + webcam: uncomment the following
+    # devices:
+    #   - /dev/video0:/dev/video0
+
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000
+
+volumes:
+  api_data:
