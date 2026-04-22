@@ -38,6 +38,9 @@ dashboard/.next/
 .DS_Store
 Thumbs.db
 
+# pytest
+.pytest_cache/
+
 # IDE
 .idea/
 .vscode/
