@@ -122,8 +122,10 @@ engineering is real and where it is intentionally a placeholder.
 - The dashboard renders a live timeline and daily counters from REST +
   WebSocket.
 - Test suites cover the pure violation-rules logic (8 tests) and the API —
-  ingestion, persistence, validation, listing/filtering, daily-stats
-  aggregation, and broadcaster fan-out / backpressure (16 tests). All pass; see
+  ingestion, persistence, input validation (confidence/bbox bounds,
+  required fields, query limits), listing/filtering, daily-stats aggregation
+  (including the UTC-day boundary), the WebSocket relay handler, and
+  broadcaster fan-out / backpressure (25 tests). All pass; see
   [Testing & CI](#testing--ci).
 
 **Intentionally a stub:**
@@ -208,7 +210,7 @@ npm run dev                                     # http://localhost:3000
 ## Testing & CI
 
 ```bash
-# API backend (16 tests: ingestion, persistence, validation, stats, broadcaster)
+# API backend (25 tests: ingestion, persistence, validation, stats, websocket, broadcaster)
 cd api
 pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
