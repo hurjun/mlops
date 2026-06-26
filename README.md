@@ -1,175 +1,304 @@
 # PPE Watchman
 
-산업 현장 CCTV/웹캠 스트림에서 **안전모·안전조끼 미착용**을 실시간 탐지하고,
-위반 이벤트를 중앙 서버에 집계해 운영자 대시보드에 표시하는
-**엣지형 + 중앙 집계형** 하이브리드 시스템 프로토타입.
+Real-time, edge-to-cloud detection of missing personal protective equipment
+(PPE) on industrial camera streams. An edge client runs YOLO inference and
+streams lightweight **violation events** to a central FastAPI hub, which
+persists them and pushes them over **WebSocket** to a live operator dashboard.
+
+![CI](https://github.com/hurjun/mlops/actions/workflows/ci.yml/badge.svg)
 
 ---
 
-## 왜 이 프로젝트인가
+## Why this project
 
-건설·제조 현장의 PPE(개인 보호 장비) 미착용은 매년 수천 건의 중대 재해로 이어진다.
-사람이 모든 CCTV를 24시간 감시하는 건 불가능하다.
-비전 AI가 이 감시 부담을 덜어내고, 위반 발생 즉시 운영자에게 알릴 수 있다.
+Missing hard hats and safety vests are a leading cause of serious injuries on
+construction and manufacturing sites. Having a person watch every CCTV feed
+around the clock does not scale. A vision model can carry that monitoring load
+and alert an operator the moment a violation appears.
 
-이 프로젝트는 그 개념을 **현장 배포 가능한 구조**로 축소 구현한다.
+I built PPE Watchman to explore the **systems engineering** that such a product
+actually requires once you move past a single-script demo: how to split work
+between the edge and a central server, keep the network cheap, survive
+connectivity loss, aggregate many sites into one view, and stream events to a
+browser in real time. The detection model itself is deliberately swappable (see
+[What works vs. what's a stub](#what-works-vs-whats-a-stub)) — the contribution
+here is the distributed, real-time event pipeline around it.
 
 ---
 
-## 아키텍처
+## Architecture
 
+```mermaid
+flowchart LR
+    subgraph edge["Edge site (one per camera)"]
+        FS["Frame source<br/>webcam · RTSP · file"]
+        INF["YOLOv8 inference<br/>→ Detection"]
+        VR["Violation rules<br/>(site-specific PPE)"]
+        EP["Event publisher<br/>(HTTP, pluggable)"]
+        FS --> INF --> VR --> EP
+    end
+
+    EP -- "POST /events<br/>(JSON + JPEG snapshot)" --> API
+
+    subgraph hub["Central hub"]
+        API["FastAPI<br/>events · stats · /ws"]
+        DB[("SQLite")]
+        BC["In-memory<br/>pub/sub broadcaster"]
+        API --> DB
+        API --> BC
+    end
+
+    BC -- "WebSocket /ws<br/>(events, no snapshot)" --> DASH["Next.js operator<br/>dashboard"]
 ```
-detector (엣지)  ──POST /events──▶  api (중앙)  ──WebSocket──▶  dashboard (운영자)
- frame source                          SQLite
- YOLO inference                        broadcaster (asyncio.Queue)
- violation rules
- event publisher
+
+End-to-end flow of a single violation:
+
+```mermaid
+sequenceDiagram
+    participant Cam as Camera frame
+    participant Det as detector
+    participant API as FastAPI hub
+    participant DB as SQLite
+    participant Web as dashboard
+
+    Cam->>Det: frame (sampled 1 of N)
+    Det->>Det: YOLO infer → rules → cooldown check
+    Det->>API: POST /events (+ snapshot)
+    API->>DB: INSERT violation_events
+    API-->>Det: 201 Created
+    API->>Web: broadcast event over /ws (no snapshot)
+    Web->>Web: prepend to live timeline + counters
 ```
 
 ---
 
-## 세 컴포넌트: 왜 쪼갰나
+## Components
 
-| 컴포넌트 | 역할 | 배포 위치 |
+| Service | Responsibility | Deployment target |
 |---|---|---|
-| **detector** | 프레임 수집 → YOLO 추론 → 위반 판정 → 이벤트 전송 | 현장 엣지 PC / Jetson |
-| **api** | 이벤트 수집·저장·브로드캐스트 | 사내 서버 / 클라우드 |
-| **dashboard** | 실시간 위반 타임라인 + 일일 통계 | 관제실 브라우저 |
+| **detector** | Read frames → YOLO inference → apply site PPE rules → publish violation events | Edge PC / NVIDIA Jetson at the site |
+| **api** | Ingest, validate, and persist events; expose REST + WebSocket; aggregate daily stats | On-prem server or cloud |
+| **dashboard** | Live violation timeline and per-kind / per-site counters | Control-room browser |
 
-**분리 이유:**
+Why three services instead of one:
 
-1. **대역폭 절약**: 현장에서 프레임(수십 MB/s) 대신 이벤트(수 KB)만 전송
-2. **엣지 자율성**: 중앙 서버 연결이 끊겨도 현장 감시는 계속 (네트워크 실패 시 경고 로그만)
-3. **멀티 사이트 관제**: 여러 현장 detector → 하나의 api → 한 대시보드에서 전체 관제
+1. **Bandwidth** — the edge sends a few KB per event instead of a multi-MB/s
+   video stream, so many sites can report to one hub over modest links.
+2. **Edge autonomy** — if the link to the hub drops, the detector keeps running
+   locally and only logs a warning; monitoring does not stop at the site.
+3. **Multi-site supervision** — many detectors fan into one API and one
+   dashboard, so an operator watches every site from a single screen.
 
 ---
 
-## 핵심 설계 결정과 Trade-off
+## Key design decisions and trade-offs
 
-| 결정 | 이유 | 프로덕션 확장 경로 |
+| Decision | Reasoning | Production extension path |
 |---|---|---|
-| `violation_rules.py` 격리 | 현장마다 PPE 규칙이 다름 (건설=안전모, 화학=조끼+보안경) | 현장별 설정 파일 주입 |
-| `inference.py` → Detection 계약 | 모델 교체(TensorRT/ONNX) 시 파이프라인 코드 무변경 | `nvcr.io/nvidia/l4t` 기반 Jetson 이미지 |
-| `event_publisher.py` 추상화 | HTTP/MQTT/WebSocket 교체 가능 | 공장 격리망은 MQTT broker 경유 |
-| 프레임 샘플링 (5프레임에 1회) | PPE 상태는 초 단위로 바뀌지 않음 → GPU 부하 5배 절감 | Temporal smoothing으로 FP 추가 감소 |
-| Cooldown (10초) | 같은 위반의 API 스팸 방지 | 위반 지속 시간 트래킹으로 진화 |
-| SQLite + in-memory broadcaster | 프로토타입 단순성 | Postgres + Redis pub/sub |
-| WebSocket (REST polling 아님) | 이벤트 발생 시 즉시 push → 실시간성, 불필요한 요청 없음 | 동일 인터페이스 유지 |
-| Docker Compose | 명령어 하나로 전체 스택 기동 | K8s manifest로 확장 |
+| Isolate `violation_rules.py` | PPE requirements differ by site (construction = helmet; chemical plant = helmet + vest + goggles) | Per-site rule config injected at startup |
+| `inference.py` returns a `Detection` value object | The model can be swapped (TensorRT / ONNX) without touching the pipeline | Jetson `l4t` image with a TensorRT engine |
+| `EventPublisher` abstraction | Transport (HTTP / MQTT / WebSocket) is hidden from the pipeline | MQTT broker for air-gapped factory networks |
+| Frame sampling (process 1 of N frames) | PPE state does not change frame-to-frame, so inference is run ~N× less often | Add temporal smoothing to further cut false positives |
+| Per-kind cooldown | One ongoing violation must not spam the API every frame | Track violation duration instead of a fixed window |
+| SQLite + in-memory broadcaster | Simple, single-process prototype storage and fan-out | Postgres + Redis pub/sub for multi-worker scale-out |
+| WebSocket push (not REST polling) | Events reach the dashboard the instant they occur, with no polling overhead | Same interface, Redis-backed fan-out |
+| One Docker image per service | Each tier deploys independently to its target | Kubernetes manifests |
 
 ---
 
-## 프로덕션에서 추가 고민할 것
+## What works vs. what's a stub
 
-- **모델 경량화**: TensorRT FP16/INT8 변환으로 Jetson에서 추론 속도 향상
-- **Temporal smoothing**: 연속 N 프레임에서 위반 감지 시에만 이벤트 발생 → FP 감소
-- **MLOps 데이터 루프**: 위반 스냅샷을 S3에 적재 → 라벨링 → 재학습 파이프라인
-- **MQTT publisher**: 인터넷 격리 공장망 대응
-- **프라이버시**: 스냅샷 저장 범위, 얼굴 블러 처리, 데이터 보존 정책
+This is an honest accounting — the goal is to be clear about where the
+engineering is real and where it is intentionally a placeholder.
+
+**Working, end-to-end:**
+
+- The full pipeline runs as three real services and a violation flows
+  edge → API → persisted row → WebSocket → dashboard.
+- Frame sampling and per-kind cooldown are implemented in `pipeline.py`.
+- The API validates input (Pydantic), persists to SQLite, and fans out to all
+  connected dashboards via a bounded-queue broadcaster with backpressure
+  handling (a slow client is dropped, not allowed to block the broadcast).
+- The dashboard renders a live timeline and daily counters from REST +
+  WebSocket.
+- Test suites cover the pure violation-rules logic (8 tests) and the API —
+  ingestion, persistence, validation, listing/filtering, daily-stats
+  aggregation, and broadcaster fan-out / backpressure (16 tests). All pass; see
+  [Testing & CI](#testing--ci).
+
+**Intentionally a stub:**
+
+- **Detection model.** The detector loads stock **COCO YOLOv8n** weights, not a
+  PPE fine-tuned model. With those weights, `violation_rules.py` runs a
+  documented heuristic fallback ("a detected `person` with no helmet/vest class
+  in the same frame ⇒ violation") purely so the pipeline produces events
+  end-to-end. The code already supports a fine-tuned model: point `MODEL_PATH`
+  at, e.g., a hard-hat detector and the direct-label path (`no_helmet`,
+  `no_vest`) takes over automatically.
+
+**Not implemented (out of scope for this prototype):**
+
+- No quantitative detection metrics (precision/recall) or measured FPS/latency
+  benchmarks — those require a fine-tuned model and a labeled dataset.
+- No authentication / authorization.
+- Single camera per detector (multi-camera = run multiple detector instances).
+- The in-memory broadcaster assumes a single uvicorn worker; multi-worker
+  fan-out needs Redis.
 
 ---
 
-## 실행 방법
+## Quickstart (full stack)
+
+Requires Docker. The detector defaults to a file frame source, so provide a
+short clip:
 
 ```bash
-# 1. 환경변수 설정
+# 1. Environment
 cp .env.example .env
 
-# 2. 샘플 영상 준비 (공사현장 무료 영상)
-# https://www.pexels.com/search/videos/construction/ 에서 다운로드
-# → samples/sample.mp4 로 저장
+# 2. Sample footage (any construction/industrial clip works)
+#    Save it to samples/sample.mp4. Free clips: https://www.pexels.com/search/videos/construction/
+#    (Alternatively set FRAME_SOURCE=webcam on Linux with a camera attached.)
 
-# 3. 전체 스택 기동 (명령어 하나)
-docker-compose up --build
+# 3. Bring up all three services
+docker compose up --build
 ```
 
-| 서비스 | URL |
+| Service | URL |
 |---|---|
-| API 문서 (Swagger) | http://localhost:8000/docs |
-| 대시보드 | http://localhost:3000 |
+| API docs (Swagger) | http://localhost:8000/docs |
+| Operator dashboard | http://localhost:3000 |
+
+On first run the detector downloads `yolov8n.pt` from the Ultralytics CDN.
+
+`make up` / `make down` wrap the compose commands.
 
 ---
 
-## 단위 테스트
+## Local development (per service)
+
+**API**
+
+```bash
+cd api
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+uvicorn src.main:app --reload --port 8000      # Swagger at /docs
+```
+
+**Detector**
 
 ```bash
 cd detector
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pytest -v
+python -m src.main                              # reads config from env / .env
 ```
 
-```
-tests/test_violation_rules.py::TestCaseA_DirectViolationLabels::test_no_helmet_detected PASSED
-tests/test_violation_rules.py::TestCaseA_DirectViolationLabels::test_no_vest_detected PASSED
-tests/test_violation_rules.py::TestCaseA_DirectViolationLabels::test_violation_not_in_required_ppe_ignored PASSED
-tests/test_violation_rules.py::TestCaseB_CocoFallback::test_person_without_helmet_triggers_violation PASSED
-tests/test_violation_rules.py::TestCaseB_CocoFallback::test_person_with_helmet_no_violation PASSED
-tests/test_violation_rules.py::TestCaseB_CocoFallback::test_person_missing_multiple_ppe PASSED
-tests/test_violation_rules.py::TestCaseB_CocoFallback::test_no_person_no_violation PASSED
-tests/test_violation_rules.py::TestCaseB_CocoFallback::test_empty_detections PASSED
+**Dashboard**
 
-8 passed in 0.13s
+```bash
+cd dashboard
+npm install
+npm run dev                                     # http://localhost:3000
 ```
 
 ---
 
-## 디렉터리 구조
+## Testing & CI
+
+```bash
+# API backend (16 tests: ingestion, persistence, validation, stats, broadcaster)
+cd api
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+
+# Detector rules (8 tests: pure violation-logic, no model needed)
+cd detector
+pip install numpy pytest
+python -m pytest -q
+```
+
+`make api-test`, `make api-lint`, and `make detector-test` wrap these.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request:
+
+- **backend** job — `ruff` lint over `api/` + `detector/`, then the API pytest suite.
+- **detector** job — the violation-rules unit tests with a minimal dependency set.
+
+---
+
+## Configuration
+
+All configuration is via environment variables (see `.env.example`).
+
+| Variable | Service | Default | Purpose |
+|---|---|---|---|
+| `API_URL` | detector | `http://localhost:8000` | Hub base URL |
+| `SITE_ID` | detector | `site-001` | Identifies the reporting site |
+| `FRAME_SOURCE` | detector | `file` | `webcam` \| `rtsp` \| `file` |
+| `VIDEO_FILE` | detector | `samples/sample.mp4` | Clip for `file` source |
+| `MODEL_PATH` | detector | `yolov8n.pt` | YOLO weights (swap for a PPE model) |
+| `CONFIDENCE_THRESHOLD` | detector | `0.4` | Min detection confidence |
+| `INFERENCE_INTERVAL` | detector | `5` | Run inference on 1 of every N frames |
+| `VIOLATION_COOLDOWN_SEC` | detector | `10` | Suppress repeat alerts of the same kind |
+| `DATABASE_URL` | api | `sqlite:///./data/events.db` | SQLAlchemy URL |
+| `CORS_ORIGINS` | api | `http://localhost:3000` | Comma-separated allowed origins |
+| `NEXT_PUBLIC_API_URL` / `NEXT_PUBLIC_WS_URL` | dashboard | localhost:8000 | API + WebSocket endpoints |
+
+---
+
+## Roadmap
+
+- [ ] Swap in a PPE fine-tuned model (e.g. a hard-hat detector) and report
+      precision/recall on a labeled set
+- [ ] Jetson TensorRT engine conversion + measured FPS benchmark
+- [ ] Temporal smoothing (only emit after N consecutive violating frames)
+- [ ] Snapshot upload to object storage (S3) with a retention policy
+- [ ] MQTT publisher for air-gapped factory networks
+- [ ] Postgres + Redis pub/sub for multi-worker scale-out
+
+---
+
+## Repository layout
 
 ```
-ppe-watchman/
-├── detector/                   # 엣지 추론 서비스
+.
+├── detector/                 # Edge inference service (Python)
 │   ├── src/
-│   │   ├── config.py           # 환경변수 → Config 객체
-│   │   ├── frame_source.py     # webcam/RTSP/file 추상화
-│   │   ├── inference.py        # YOLO 래퍼 → Detection 계약
-│   │   ├── violation_rules.py  # 현장별 PPE 규칙 (커스터마이징 포인트)
-│   │   ├── event_publisher.py  # HTTP publisher (MQTT 교체 가능)
-│   │   ├── pipeline.py         # 샘플링 + cooldown 오케스트레이션
-│   │   └── main.py             # 의존성 조립 + 실행
-│   └── tests/
-│       └── test_violation_rules.py
+│   │   ├── config.py         # env → Config
+│   │   ├── frame_source.py   # webcam / RTSP / file abstraction
+│   │   ├── inference.py      # YOLO wrapper → Detection contract
+│   │   ├── violation_rules.py# site-specific PPE rules (customization point)
+│   │   ├── event_publisher.py# HTTP publisher (MQTT-swappable)
+│   │   ├── pipeline.py        # sampling + cooldown orchestration
+│   │   └── main.py            # dependency wiring + run loop
+│   └── tests/test_violation_rules.py
 │
-├── api/                        # 중앙 FastAPI 서버
-│   └── src/
-│       ├── database.py         # SQLAlchemy 연결
-│       ├── models.py           # ViolationEvent 테이블
-│       ├── schemas.py          # Pydantic 입출력 스키마
-│       ├── broadcaster.py      # in-memory pub/sub
-│       └── routers/
-│           ├── events.py       # POST/GET /events
-│           ├── stats.py        # GET /stats/daily
-│           └── stream.py       # WebSocket /ws
+├── api/                      # Central FastAPI hub
+│   ├── src/
+│   │   ├── database.py       # SQLAlchemy engine/session
+│   │   ├── models.py         # ViolationEvent table
+│   │   ├── schemas.py        # Pydantic request/response models
+│   │   ├── broadcaster.py    # in-memory WebSocket pub/sub
+│   │   └── routers/          # events · stats · stream (/ws)
+│   ├── tests/                # pytest: API + persistence + broadcaster
+│   └── requirements-dev.txt
 │
-├── dashboard/                  # Next.js 14 운영자 대시보드
-│   ├── app/
-│   │   ├── page.tsx            # 서버 컴포넌트 (초기 데이터 fetch)
-│   │   └── LiveTimeline.tsx    # 클라이언트 컴포넌트 (WebSocket)
-│   └── lib/
-│       ├── types.ts            # ViolationEvent, DailyStats 타입
-│       └── websocket.ts        # useLiveEvents 훅
+├── dashboard/                # Next.js 14 operator dashboard
+│   ├── app/                  # page.tsx (SSR fetch) + LiveTimeline.tsx (WS)
+│   └── lib/                  # types + useLiveEvents hook
 │
-├── samples/                    # 테스트용 영상 (직접 준비)
-├── docker-compose.yml          # 전체 스택 오케스트레이션
-└── .env.example                # 환경변수 템플릿
+├── docker-compose.yml        # full-stack orchestration
+├── pyproject.toml            # shared ruff config
+├── Makefile                  # dev convenience targets
+└── .github/workflows/ci.yml  # lint + tests
 ```
 
 ---
 
-## 알려진 한계
+## Tech stack
 
-- **COCO pretrained weights** 사용 중 (PPE fine-tuned 모델 미적용)
-  - `MODEL_PATH`에 `keremberke/yolov8n-hard-hat-detection` 교체 시 Case A 경로 동작
-- **단일 카메라** 스트림 (멀티 카메라는 detector 인스턴스 복수 기동으로 대응)
-- **인증/권한 시스템** 없음
-- **in-memory broadcaster**: uvicorn 단일 프로세스 전제 (멀티 워커 시 Redis 필요)
-
----
-
-## Next Steps
-
-- [ ] PPE fine-tuned 모델 교체 (`keremberke/yolov8n-hard-hat-detection`)
-- [ ] Jetson TensorRT engine 변환 + FPS 벤치마크
-- [ ] Temporal smoothing (연속 N 프레임 위반 시에만 이벤트 발생)
-- [ ] S3 스냅샷 업로드
-- [ ] MQTT publisher 구현 (공장 격리망 대응)
-- [ ] Postgres + Redis 교체 (멀티 워커 스케일아웃)
+Python 3.11 · Ultralytics YOLOv8 · OpenCV (headless) · FastAPI · Uvicorn ·
+SQLAlchemy 2.0 / SQLite · Pydantic v2 · asyncio WebSocket pub/sub ·
+Next.js 14 (App Router) · React 18 · TypeScript · Docker Compose · pytest · ruff
