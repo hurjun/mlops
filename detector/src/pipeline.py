@@ -7,8 +7,6 @@ from __future__ import annotations
 import logging
 import time
 
-import numpy as np
-
 from .event_publisher import EventPublisher
 from .frame_source import FrameSource
 from .inference import YoloDetector
