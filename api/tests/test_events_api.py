@@ -8,6 +8,7 @@ GET /stats/daily to aggregate. The database is an isolated in-memory SQLite
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 from src.models import ViolationEvent
 
@@ -123,3 +124,94 @@ def test_daily_stats_aggregates_by_site_and_kind(client) -> None:
     assert stats["total"] == 3
     assert stats["by_kind"] == {"no_helmet": 2, "no_vest": 1}
     assert stats["by_site"] == {"site-A": 2, "site-B": 1}
+
+
+# ── input-validation edge cases ──────────────────────────────────────────────
+
+
+def test_create_event_accepts_confidence_boundaries(client) -> None:
+    """confidence is validated with an inclusive [0.0, 1.0] range, so both
+    endpoints must be accepted."""
+    for value in (0.0, 1.0):
+        resp = client.post("/events", json={**VALID_EVENT, "confidence": value})
+        assert resp.status_code == 201, value
+        assert resp.json()["confidence"] == value
+
+
+def test_create_event_rejects_negative_confidence(client) -> None:
+    bad = {**VALID_EVENT, "confidence": -0.01}
+    resp = client.post("/events", json=bad)
+    assert resp.status_code == 422
+
+
+def test_create_event_rejects_too_long_bbox(client) -> None:
+    """The bbox must be exactly four values; five is as invalid as three."""
+    bad = {**VALID_EVENT, "bbox_xyxy_norm": [0.1, 0.2, 0.3, 0.4, 0.5]}
+    resp = client.post("/events", json=bad)
+    assert resp.status_code == 422
+
+
+def test_create_event_rejects_missing_required_field(client) -> None:
+    bad = {k: v for k, v in VALID_EVENT.items() if k != "site_id"}
+    resp = client.post("/events", json=bad)
+    assert resp.status_code == 422
+
+
+def test_list_events_rejects_invalid_limit(client) -> None:
+    """limit is constrained to 1..100; values outside the range are rejected
+    by query-param validation rather than silently clamped."""
+    assert client.get("/events", params={"limit": 0}).status_code == 422
+    assert client.get("/events", params={"limit": 101}).status_code == 422
+
+
+# ── daily-stats aggregation edge cases ───────────────────────────────────────
+
+
+def test_daily_stats_empty(client) -> None:
+    """With no events the aggregation returns zeroed counters for today (UTC),
+    not an error."""
+    stats = client.get("/stats/daily").json()
+    assert stats["total"] == 0
+    assert stats["by_site"] == {}
+    assert stats["by_kind"] == {}
+    assert stats["date"] == datetime.now(timezone.utc).date().isoformat()
+
+
+def test_daily_stats_excludes_events_before_today_utc(client, db_session) -> None:
+    """Only events at/after today's UTC midnight are counted.
+
+    Guards the UTC-boundary aggregation: an event one second before today's
+    UTC midnight must be excluded while one just after must be included. We
+    insert rows directly with explicit ``occurred_at`` to pin the boundary.
+    """
+    today_utc = datetime.now(timezone.utc).date()
+    today_start = datetime(
+        today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc
+    )
+
+    db_session.add_all(
+        [
+            ViolationEvent(
+                site_id="site-yesterday",
+                kind="no_helmet",
+                confidence=0.9,
+                bbox=json.dumps([0.1, 0.2, 0.3, 0.4]),
+                description="before today (UTC)",
+                occurred_at=today_start - timedelta(seconds=1),
+            ),
+            ViolationEvent(
+                site_id="site-today",
+                kind="no_vest",
+                confidence=0.8,
+                bbox=json.dumps([0.1, 0.2, 0.3, 0.4]),
+                description="after today's UTC midnight",
+                occurred_at=today_start + timedelta(seconds=1),
+            ),
+        ]
+    )
+    db_session.commit()
+
+    stats = client.get("/stats/daily").json()
+    assert stats["total"] == 1
+    assert stats["by_site"] == {"site-today": 1}
+    assert stats["by_kind"] == {"no_vest": 1}
