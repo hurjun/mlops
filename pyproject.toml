@@ -1,0 +1,14 @@
+# Shared tooling config for the Python services (api, detector).
+# Ruff is used in CI for linting; tests use pytest from each service directory.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "venv", "build", "dist"]
+
+[tool.ruff.lint]
+# E/W = pep8 (pycodestyle), F = pyflakes (unused imports, undefined names).
+# E501 (line length) is left off because the docstrings are intentionally
+# verbose; correctness rules (F) are what matter most here.
+select = ["E", "F", "W"]
+ignore = ["E501"]

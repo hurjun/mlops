@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    name: API lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install API dependencies
+        run: pip install -r api/requirements.txt -r api/requirements-dev.txt
+
+      - name: Ruff lint (api + detector)
+        run: ruff check api detector
+
+      - name: API tests
+        working-directory: api
+        run: python -m pytest -q
+
+  detector:
+    name: Detector unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The violation-rules unit tests only need numpy (imported by
+      # inference.py at module load) and pytest. The heavy ultralytics /
+      # opencv stack is intentionally not installed here — those are only
+      # needed to actually run inference, not to test the pure rules logic.
+      - name: Install minimal test dependencies
+        run: pip install numpy==1.26.4 pytest==8.3.3
+
+      - name: Detector tests
+        working-directory: detector
+        run: python -m pytest -q
