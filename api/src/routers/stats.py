@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -30,9 +30,12 @@ def daily_stats(db: Session = Depends(get_db)) -> DailyStats:
     }
     """
     # 오늘 UTC 자정 계산
-    # 예: 2026-04-21 00:00:00 UTC
-    today_start = datetime.combine(date.today(), datetime.min.time()).replace(
-        tzinfo=timezone.utc
+    # occurred_at은 UTC 기준으로 저장되므로 "오늘"도 반드시 UTC로 계산해야 한다.
+    # date.today()(로컬 날짜)를 쓰면 로컬-UTC 시차 때문에 집계가 어긋난다
+    # (예: KST(UTC+9) 자정 직후에는 로컬 날짜가 UTC보다 하루 앞서 0건이 잡힘).
+    today_utc = datetime.now(timezone.utc).date()
+    today_start = datetime(
+        today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc
     )
 
     # 오늘 발생한 모든 위반 이벤트 조회
@@ -53,7 +56,7 @@ def daily_stats(db: Session = Depends(get_db)) -> DailyStats:
         by_kind[row.kind] = by_kind.get(row.kind, 0) + 1
 
     return DailyStats(
-        date=date.today(),
+        date=today_utc,
         by_site=by_site,
         by_kind=by_kind,
         total=len(rows),
