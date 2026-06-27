@@ -70,6 +70,19 @@ sequenceDiagram
     Web->>Web: prepend to live timeline + counters
 ```
 
+### Operator dashboard
+
+The control-room view: a live violation timeline (newest first, colour-coded by
+PPE kind) plus per-site and per-kind counters. Each card shows the site, model
+confidence, and time of the event. Events arrive over the WebSocket and are
+prepended in real time.
+
+![PPE Watchman operator dashboard showing the daily counters and a live timeline of hard-hat and safety-vest violations across two sites](docs/dashboard.png)
+
+> Captured from the running Next.js dashboard with sample violation events
+> POSTed through the real `/events` API. See
+> [Local development](#local-development-per-service) to reproduce.
+
 ---
 
 ## Components
